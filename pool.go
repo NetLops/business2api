@@ -47,12 +47,14 @@ type Account struct {
 	LastRefresh time.Time
 	LastUsed    time.Time // 最后使用时间
 	Refreshed   bool
+	FailCount   int // 刷新失败次数
 	mu          sync.Mutex
 }
 
-const (
+var (
 	refreshCooldown     = 4 * time.Minute
-	idleRefreshInterval = 5 * time.Hour // 5小时未使用或未刷新则刷新
+	useCooldown         = 10 * time.Second // 使用冷却，防止同一账号短时间内被重复使用
+	idleRefreshInterval = 5 * time.Hour    // 5小时未使用或未刷新则刷新
 )
 
 type AccountPool struct {
@@ -63,6 +65,18 @@ type AccountPool struct {
 	refreshInterval time.Duration
 	refreshWorkers  int
 	stopChan        chan struct{}
+}
+
+// SetRefreshCooldown 设置刷新冷却时间
+func (p *AccountPool) SetRefreshCooldown(d time.Duration) {
+	refreshCooldown = d
+	log.Printf("⚙️ 刷新冷却时间设置为: %v", d)
+}
+
+// SetUseCooldown 设置使用冷却时间
+func (p *AccountPool) SetUseCooldown(d time.Duration) {
+	useCooldown = d
+	log.Printf("⚙️ 使用冷却时间设置为: %v", d)
 }
 
 var pool = &AccountPool{
@@ -240,17 +254,33 @@ func (p *AccountPool) refreshWorker(id int) {
 
 		acc.JWTExpires = time.Time{}
 		if err := acc.RefreshJWT(); err != nil {
-			if strings.Contains(err.Error(), "账号失效") {
-				log.Printf("❌ [worker-%d] [%s] %v", id, acc.Data.Email, err)
-				p.RemoveAccount(acc)
-			} else if strings.Contains(err.Error(), "刷新冷却中") {
+			if strings.Contains(err.Error(), "刷新冷却中") {
 				acc.Refreshed = true
 				p.MarkReady(acc)
+			} else if strings.Contains(err.Error(), "账号失效") {
+				// 401/403 认证失败，直接删除
+				log.Printf("❌ [worker-%d] [%s] 认证失败，删除账号", id, acc.Data.Email)
+				p.RemoveAccount(acc)
 			} else {
-				log.Printf("⚠️ [worker-%d] [%s] 刷新失败: %v，稍后重试", id, acc.Data.Email, err)
-				p.MarkPending(acc)
+				// 其他错误，记录失败次数，超3次则删除
+				acc.mu.Lock()
+				acc.FailCount++
+				failCount := acc.FailCount
+				acc.mu.Unlock()
+
+				if failCount >= 3 {
+					log.Printf("❌ [worker-%d] [%s] 刷新失败%d次，删除账号", id, acc.Data.Email, failCount)
+					p.RemoveAccount(acc)
+				} else {
+					log.Printf("⚠️ [worker-%d] [%s] 刷新失败(%d/3): %v，稍后重试", id, acc.Data.Email, failCount, err)
+					p.MarkPending(acc)
+				}
 			}
 		} else {
+			// 成功刷新，重置失败计数
+			acc.mu.Lock()
+			acc.FailCount = 0
+			acc.mu.Unlock()
 			if err := acc.SaveToFile(); err != nil {
 				log.Printf("⚠️ [%s] 写回文件失败: %v", acc.Data.Email, err)
 			}
@@ -348,47 +378,54 @@ func (p *AccountPool) Next() *Account {
 	n := len(p.readyAccounts)
 	startIdx := atomic.AddUint64(&p.index, 1) - 1
 	var selectedAcc *Account
+	now := time.Now()
+
+	// 优先选择不在使用冷却且不在刷新冷却的账号
 	for i := 0; i < n; i++ {
 		acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
 		acc.mu.Lock()
-		inCooldown := time.Since(acc.LastRefresh) < refreshCooldown
+		inUseCooldown := now.Sub(acc.LastUsed) < useCooldown
+		inRefreshCooldown := now.Sub(acc.LastRefresh) < refreshCooldown
 		acc.mu.Unlock()
-		if !inCooldown {
+
+		// 跳过正在使用冷却中的账号
+		if inUseCooldown {
+			continue
+		}
+		// 优先选择不在刷新冷却的
+		if !inRefreshCooldown {
 			selectedAcc = acc
 			break
 		}
+		// 记录第一个不在使用冷却的账号作为备选
+		if selectedAcc == nil {
+			selectedAcc = acc
+		}
 	}
+
+	// 如果所有账号都在使用冷却中，选择使用时间最早的
 	if selectedAcc == nil {
-		selectedAcc = p.readyAccounts[startIdx%uint64(n)]
+		var oldestAcc *Account
+		var oldestTime time.Time
+		for i := 0; i < n; i++ {
+			acc := p.readyAccounts[(startIdx+uint64(i))%uint64(n)]
+			acc.mu.Lock()
+			lastUsed := acc.LastUsed
+			acc.mu.Unlock()
+			if oldestAcc == nil || lastUsed.Before(oldestTime) {
+				oldestAcc = acc
+				oldestTime = lastUsed
+			}
+		}
+		selectedAcc = oldestAcc
 	}
 	p.mu.RUnlock()
 
-	// 取出账号时立即刷新
+	// 取出账号时立即标记使用时间
 	if selectedAcc != nil {
 		selectedAcc.mu.Lock()
 		selectedAcc.LastUsed = time.Now()
 		selectedAcc.mu.Unlock()
-
-		// 异步刷新JWT（不阻塞返回）
-		go func(acc *Account) {
-			acc.mu.Lock()
-			needsRefresh := time.Since(acc.LastRefresh) >= refreshCooldown
-			acc.mu.Unlock()
-
-			if needsRefresh {
-				if err := acc.RefreshJWT(); err != nil {
-					if !strings.Contains(err.Error(), "刷新冷却中") {
-						log.Printf("⚠️ [%s] 使用时刷新失败: %v", acc.Data.Email, err)
-					}
-				} else {
-					if err := acc.SaveToFile(); err != nil {
-						log.Printf("⚠️ [%s] 写回文件失败: %v", acc.Data.Email, err)
-					} else {
-						log.Printf("✅ [%s] 使用时刷新成功，已写回文件", acc.Data.Email)
-					}
-				}
-			}
-		}(selectedAcc)
 	}
 
 	return selectedAcc

@@ -35,6 +35,8 @@ type PoolConfig struct {
 	RegisterThreads      int  `json:"register_threads"`       // 注册线程数
 	RegisterHeadless     bool `json:"register_headless"`      // 无头模式
 	RefreshOnStartup     bool `json:"refresh_on_startup"`     // 启动时刷新账号
+	RefreshCooldownSec   int  `json:"refresh_cooldown_sec"`   // 刷新冷却时间(秒)
+	UseCooldownSec       int  `json:"use_cooldown_sec"`       // 使用冷却时间(秒)
 }
 
 type AppConfig struct {
@@ -56,6 +58,8 @@ var appConfig = AppConfig{
 		RegisterThreads:      1,
 		RegisterHeadless:     true,
 		RefreshOnStartup:     true,
+		RefreshCooldownSec:   240, // 4分钟
+		UseCooldownSec:       10,  // 10秒内不重复使用同一账号
 	},
 }
 
@@ -116,6 +120,14 @@ func loadAppConfig() {
 	Proxy = appConfig.Proxy
 	ListenAddr = appConfig.ListenAddr
 	DefaultConfig = appConfig.DefaultConfig
+
+	// 应用冷却时间配置
+	if appConfig.Pool.RefreshCooldownSec > 0 {
+		pool.SetRefreshCooldown(time.Duration(appConfig.Pool.RefreshCooldownSec) * time.Second)
+	}
+	if appConfig.Pool.UseCooldownSec > 0 {
+		pool.SetUseCooldown(time.Duration(appConfig.Pool.UseCooldownSec) * time.Second)
+	}
 }
 
 var FixedModels = []string{
@@ -995,7 +1007,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	createdTime := time.Now().Unix()
 	clientIP := c.ClientIP()
 	// 入站日志
-	log.Printf("📥 [%s] 请求: model=%s ", clientIP, req.Model)
+	log.Printf("📥 [%s] 请求: model=%s 消息数=%d", clientIP, req.Model, len(req.Messages))
 	// 解析消息：支持多轮对话拼接和系统提示词
 	var textContent string
 	var images []MediaInfo
@@ -1024,28 +1036,40 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			textContent = userText
 		}
 	}
+
 	var respBody []byte
 	var lastErr error
 	var usedAcc *Account
 	var usedJWT, usedOrigAuth, usedConfigID, usedSession string
 
-	for retry := 0; retry < maxRetries; retry++ {
+	retries := 0
+	loopCount := 0
+
+	for {
+		// 检查重试次数（只计算非401错误）
+		if retries >= maxRetries {
+			break
+		}
+		// 防止无限循环
+		if loopCount > 100 {
+			lastErr = fmt.Errorf("重试次数过多，停止重试")
+			break
+		}
+		loopCount++
+
 		acc := pool.Next()
 		if acc == nil {
 			c.JSON(500, gin.H{"error": "没有可用账号"})
 			return
 		}
 		usedAcc = acc
-		log.Printf("📤 [%s] 使用账号: %s", clientIP, acc.Data.Email)
-
-		if retry > 0 {
-			log.Printf("🔄 第 %d 次重试，切换账号: %s", retry+1, acc.Data.Email)
-		}
+		log.Printf("📤 [%s] 使用账号: %s (尝试 %d/%d)", clientIP, acc.Data.Email, retries+1, maxRetries)
 
 		jwt, configID, err := acc.GetJWT()
 		if err != nil {
 			log.Printf("❌ [%s] 获取 JWT 失败: %v", acc.Data.Email, err)
 			lastErr = err
+			retries++
 			continue
 		}
 
@@ -1055,6 +1079,8 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			// 401 错误标记账号需要刷新
 			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
 				pool.MarkNeedsRefresh(acc)
+			} else {
+				retries++
 			}
 			lastErr = err
 			continue
@@ -1063,6 +1089,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		// 上传媒体文件并获取 fileIds
 		var fileIds []string
 		uploadFailed := false
+		is401 := false
 		for _, media := range images {
 			var fileId string
 			var err error
@@ -1093,12 +1120,20 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			if err != nil {
 				log.Printf("⚠️ [%s] %s上传失败: %v", acc.Data.Email, mediaTypeName, err)
 				uploadFailed = true
+				if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
+					is401 = true
+				}
 				break
 			}
 			fileIds = append(fileIds, fileId)
 		}
 		if uploadFailed {
 			lastErr = fmt.Errorf("媒体上传失败")
+			if is401 {
+				pool.MarkNeedsRefresh(acc)
+			} else {
+				retries++
+			}
 			continue
 		}
 
@@ -1106,6 +1141,10 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		queryParts := []map[string]interface{}{}
 		if textContent != "" {
 			queryParts = append(queryParts, map[string]interface{}{"text": textContent})
+		}
+		// 确保 query parts 不为空，否则 Google 可能返回空响应
+		if len(queryParts) == 0 {
+			queryParts = append(queryParts, map[string]interface{}{"text": " "})
 		}
 
 		// 检查模型类型后缀
@@ -1150,25 +1189,36 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		if err != nil {
 			log.Printf("❌ [%s] 请求失败: %v", acc.Data.Email, err)
 			lastErr = err
+			retries++
 			continue
 		}
 
 		if resp.StatusCode != 200 {
-			body, _ := readResponseBody(resp)
 			resp.Body.Close()
-			log.Printf("❌ [%s] Google 报错: %d %s (重试 %d/%d)", acc.Data.Email, resp.StatusCode, string(body), retry+1, maxRetries)
-			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
-			// 401/403 无权限，移至刷新池
-			if resp.StatusCode == 401 || resp.StatusCode == 403 {
-				log.Printf("⚠️ [%s] %d 无权限，移至刷新池", acc.Data.Email, resp.StatusCode)
-				pool.MarkPending(acc)
-			}
-			// 429 限流，标记账号进入冷却，下次 Next() 会自动切换到其他账号
-			if resp.StatusCode == 429 {
+			log.Printf("❌ [%s] Google 报错: %d (重试 %d/%d)", acc.Data.Email, resp.StatusCode, retries+1, maxRetries)
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+
+			// 401/403/404/500 错误，切换账号
+			switch resp.StatusCode {
+			case 401, 403:
+				log.Printf("⚠️ [%s] %d 认证失败，移至刷新池", acc.Data.Email, resp.StatusCode)
+				pool.MarkNeedsRefresh(acc)
+			case 404:
+				log.Printf("⚠️ [%s] 404 资源不存在，切换账号", acc.Data.Email)
+				pool.MarkNeedsRefresh(acc)
+			case 500:
+				log.Printf("⚠️ [%s] 500 服务器错误，切换账号", acc.Data.Email)
+				// 500 错误标记冷却，让其他请求暂时不用这个账号
+				acc.mu.Lock()
+				acc.LastUsed = time.Now()
+				acc.mu.Unlock()
+			case 429:
 				acc.mu.Lock()
 				acc.LastRefresh = time.Now() // 触发冷却
 				acc.mu.Unlock()
 				log.Printf("⏳ [%s] 429 限流，账号进入冷却", acc.Data.Email)
+			default:
+				retries++
 			}
 			continue
 		}
@@ -1180,18 +1230,90 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		// 快速检查是否是认证错误响应
 		if bytes.Contains(respBody, []byte("uToken")) && !bytes.Contains(respBody, []byte("streamAssistResponse")) {
 			log.Printf("⚠️ [%s] 收到认证响应，移至刷新池", acc.Data.Email)
-			pool.MarkPending(acc)
+			pool.MarkNeedsRefresh(acc)
 			lastErr = fmt.Errorf("认证失败，需要刷新账号")
 			continue
 		}
 
-		// 检查是否有实际内容（非空返回）
-		hasContent := bytes.Contains(respBody, []byte(`"text"`)) || bytes.Contains(respBody, []byte(`"file"`)) || bytes.Contains(respBody, []byte(`"inlineData"`))
-		if !hasContent && bytes.Contains(respBody, []byte(`"thought"`)) {
-			// 只有思考内容，没有实际输出，重试
-			log.Printf("⚠️ [%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retry+1, maxRetries)
-			lastErr = fmt.Errorf("空返回，只有思考内容")
-			continue
+		// 预解析检查是否有有效内容
+		var checkDataList []map[string]interface{}
+		if err := json.Unmarshal(respBody, &checkDataList); err == nil {
+			hasValidContent := false
+			hasThought := false
+			for _, data := range checkDataList {
+				streamResp, ok := data["streamAssistResponse"].(map[string]interface{})
+				if !ok {
+					continue
+				}
+				answer, ok := streamResp["answer"].(map[string]interface{})
+				if !ok {
+					continue
+				}
+				replies, ok := answer["replies"].([]interface{})
+				if !ok {
+					continue
+				}
+				for _, reply := range replies {
+					replyMap, ok := reply.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					groundedContent, ok := replyMap["groundedContent"].(map[string]interface{})
+					if !ok {
+						continue
+					}
+					content, ok := groundedContent["content"].(map[string]interface{})
+					if !ok {
+						continue
+					}
+
+					// 检查是否有 functionCall
+					if _, ok := content["functionCall"]; ok {
+						hasValidContent = true
+					}
+					// 检查是否有 text
+					if t, ok := content["text"].(string); ok && t != "" {
+						// 区分 thought 和正文
+						if isThought, _ := content["thought"].(bool); isThought {
+							hasThought = true
+						} else {
+							hasValidContent = true
+						}
+					}
+					// 检查是否有 file/inlineData
+					if _, ok := content["file"]; ok {
+						hasValidContent = true
+					}
+					if _, ok := content["inlineData"]; ok {
+						hasValidContent = true
+					}
+				}
+			}
+
+			if !hasValidContent {
+				if hasThought {
+					log.Printf("⚠️ [%s] 响应只有思考内容，无实际输出，重试 (%d/%d)", acc.Data.Email, retries+1, maxRetries)
+					lastErr = fmt.Errorf("空返回，只有思考内容")
+					retries++
+					continue
+				} else {
+					log.Printf("⚠️ [%s] 响应完全为空 (无 text/file/tool)，重试 (%d/%d)", acc.Data.Email, retries+1, maxRetries)
+					// 打印部分响应以便调试
+					log.Printf("🔍 空响应片段: %s", string(respBody[:min(500, len(respBody))]))
+					lastErr = fmt.Errorf("空返回，无有效内容")
+					retries++
+					continue
+				}
+			}
+		} else {
+			// JSON 解析失败，可能是空响应或其他格式，交给后面逻辑处理
+			// 但这里也可以做一个简单的空检查
+			if len(respBody) == 0 {
+				log.Printf("⚠️ [%s] HTTP 200 但响应体为空，重试 (%d/%d)", acc.Data.Email, retries+1, maxRetries)
+				lastErr = fmt.Errorf("响应体为空")
+				retries++
+				continue
+			}
 		}
 
 		usedJWT = jwt

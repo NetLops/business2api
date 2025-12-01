@@ -80,9 +80,6 @@ func startRegister(count int) error {
 	if threads <= 0 {
 		threads = 1
 	}
-
-	log.Printf("📝 启动 %d 个注册线程 (原生Go)，目标: %d 个，当前: %d 个", threads, appConfig.Pool.TargetCount, pool.TotalCount())
-
 	for i := 0; i < threads; i++ {
 		go NativeRegisterWorker(i+1, dataDirAbs)
 	}

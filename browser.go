@@ -289,13 +289,13 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		return result
 	}
 	page.WaitLoad()
-	time.Sleep(1 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 	debugScreenshot(page, threadID, "01_page_loaded")
-	if _, err := page.Timeout(30 * time.Second).Element("input"); err != nil {
+	if _, err := page.Timeout(20 * time.Second).Element("input"); err != nil {
 		result.Error = fmt.Errorf("等待输入框超时: %w", err)
 		return result
 	}
-	time.Sleep(1 * time.Second)
+	time.Sleep(300 * time.Millisecond)
 
 	// 点击输入框聚焦
 	page.Eval(`() => {
@@ -305,9 +305,9 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			inputs[0].focus();
 		}
 	}`)
+	time.Sleep(200 * time.Millisecond)
+	safeType(page, email, 15)
 	time.Sleep(500 * time.Millisecond)
-	safeType(page, email, 20)
-	time.Sleep(1 * time.Second)
 	debugScreenshot(page, threadID, "02_email_input")
 
 	// 触发 blur
@@ -358,9 +358,8 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		result.Error = fmt.Errorf("找不到提交按钮")
 		return result
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(2 * time.Second)
 	debugScreenshot(page, threadID, "04_after_submit")
-	log.Printf("[注册 %d] 检查页面状态...", threadID)
 	var needsVerification bool
 	checkResult, _ := page.Eval(`() => {
 		const pageText = document.body ? document.body.textContent : '';
@@ -409,7 +408,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		maxResendAttempts := 3
 
 		for resendAttempt := 0; resendAttempt < maxResendAttempts; resendAttempt++ {
-			emailContent, _ = getVerificationEmailQuick(email, 15, 2)
+			emailContent, _ = getVerificationEmailQuick(email, 20, 2)
 
 			if emailContent != nil {
 				break
@@ -440,12 +439,12 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 					}
 					return false;
 				}`)
-				time.Sleep(3 * time.Second)
+				time.Sleep(2 * time.Second)
 			}
 		}
 
 		if emailContent == nil {
-			result.Error = fmt.Errorf("多次尝试后仍无法获取验证码邮件")
+			result.Error = fmt.Errorf("无法获取验证码邮件")
 			return result
 		}
 
@@ -457,7 +456,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		}
 
 		// 等待验证码输入框
-		time.Sleep(1 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 
 		// 清空并聚焦输入框
 		page.Eval(`() => {
@@ -468,9 +467,9 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 				inputs[0].focus();
 			}
 		}`)
+		time.Sleep(200 * time.Millisecond)
+		safeType(page, code, 15)
 		time.Sleep(500 * time.Millisecond)
-		safeType(page, code, 20)
-		time.Sleep(1 * time.Second)
 
 		// 触发 blur
 		page.Eval(`() => {
@@ -511,7 +510,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			time.Sleep(1 * time.Second)
 		}
 
-		time.Sleep(3 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 
 	// 填写姓名
@@ -519,7 +518,7 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 	result.FullName = fullName
 	log.Printf("[注册 %d] 填写姓名: %s", threadID, fullName)
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(500 * time.Millisecond)
 
 	// 清空并聚焦输入框
 	page.Eval(`() => {
@@ -530,11 +529,11 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 			inputs[0].focus();
 		}
 	}`)
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	// 输入姓名
-	safeType(page, fullName, 20)
-	time.Sleep(1 * time.Second)
+	safeType(page, fullName, 15)
+	time.Sleep(500 * time.Millisecond)
 
 	// 触发 blur
 	page.Eval(`() => {
@@ -579,13 +578,13 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		if clickResult != nil && clickResult.Value.Get("clicked").Bool() {
 			break
 		}
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
 	}
 
 	// 等待获取 authorization
 	log.Printf("[注册 %d] 等待获取 authorization...", threadID)
-	for i := 0; i < 10; i++ {
-		time.Sleep(3 * time.Second)
+	for i := 0; i < 15; i++ {
+		time.Sleep(2 * time.Second)
 
 		// 尝试点击可能出现的额外按钮
 		page.Eval(`() => {

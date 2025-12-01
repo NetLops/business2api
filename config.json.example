@@ -9,8 +9,9 @@
     "check_interval_minutes": 30,
     "register_threads": 1,
     "register_headless": true,
-    "register_script": "./main.js",
-    "refresh_on_startup": true
+    "refresh_on_startup": true,
+    "refresh_cooldown_sec": 300,
+    "use_cooldown_sec": 30
   },
   "proxy": ""
 }
