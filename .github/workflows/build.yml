@@ -7,6 +7,7 @@ on:
       - 'v*'
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
 
 env:
   GO_VERSION: '1.24'
@@ -27,34 +28,53 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
 
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.version.outputs.VERSION }}
         run: |
           EXT=""
           if [ "$GOOS" = "windows" ]; then
             EXT=".exe"
           fi
-          CGO_ENABLED=0 go build -ldflags="-s -w" -o business2api-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} .
+          CGO_ENABLED=0 go build \
+            -ldflags="-s -w -X main.Version=${VERSION}" \
+            -o business2api-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} .
 
       - name: Prepare package
         run: |
           mkdir -p dist
           mv business2api-* dist/
-          cp config.json.example dist/
+          cp config/config.json.example dist/
+          cp README.md dist/
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: business2api-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
+          retention-days: 30
 
   docker:
     runs-on: ubuntu-latest

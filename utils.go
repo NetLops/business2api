@@ -1,6 +1,7 @@
 package main
 
 import (
+	"business2api/src/pool"
 	"bytes"
 	"compress/gzip"
 	"crypto/tls"
@@ -42,14 +43,12 @@ func newHTTPClient() *http.Client {
 
 func initHTTPClient() {
 	httpClient = newHTTPClient()
+	pool.HTTPClient = httpClient
 	if Proxy != "" {
 		log.Printf("✅ 使用代理: %s", Proxy)
 	}
 }
 
-// ==================== 工具函数 ====================
-
-// readResponseBody 读取响应体，自动处理gzip
 func readResponseBody(resp *http.Response) ([]byte, error) {
 	var reader io.Reader = resp.Body
 	if resp.Header.Get("Content-Encoding") == "gzip" {
@@ -63,7 +62,6 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 	return io.ReadAll(reader)
 }
 
-// parseNDJSON 解析NDJSON格式数据
 func parseNDJSON(data []byte) []map[string]interface{} {
 	var result []map[string]interface{}
 	lines := bytes.Split(data, []byte("\n"))

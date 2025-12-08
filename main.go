@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,10 +21,15 @@ import (
 
 	_ "golang.org/x/image/bmp"
 	_ "golang.org/x/image/tiff"
+	_ "golang.org/x/image/webp"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	_ "golang.org/x/image/webp"
+
+	"business2api/src/flow"
+	"business2api/src/logger"
+	"business2api/src/pool"
+	"business2api/src/register"
 )
 
 // ==================== 配置结构 ====================
@@ -43,14 +49,43 @@ type PoolConfig struct {
 	BrowserRefreshMaxRetry int  `json:"browser_refresh_max_retry"` // 浏览器刷新最大重试次数(0=禁用)
 }
 
-type AppConfig struct {
-	APIKeys       []string   `json:"api_keys"`       // API 密钥列表
-	ListenAddr    string     `json:"listen_addr"`    // 监听地址
-	DataDir       string     `json:"data_dir"`       // 数据目录
-	Pool          PoolConfig `json:"pool"`           // 号池配置
-	Proxy         string     `json:"proxy"`          // 代理
-	DefaultConfig string     `json:"default_config"` // 默认 configId
+// FlowConfig Flow 服务配置
+type FlowConfigSection struct {
+	Enable          bool     `json:"enable"`            // 是否启用 Flow
+	Tokens          []string `json:"tokens"`            // Flow ST Tokens
+	Proxy           string   `json:"proxy"`             // Flow 专用代理
+	Timeout         int      `json:"timeout"`           // 超时时间
+	PollInterval    int      `json:"poll_interval"`     // 轮询间隔
+	MaxPollAttempts int      `json:"max_poll_attempts"` // 最大轮询次数
 }
+
+type AppConfig struct {
+	APIKeys       []string              `json:"api_keys"`       // API 密钥列表
+	ListenAddr    string                `json:"listen_addr"`    // 监听地址
+	DataDir       string                `json:"data_dir"`       // 数据目录
+	Pool          PoolConfig            `json:"pool"`           // 号池配置
+	Proxy         string                `json:"proxy"`          // 代理
+	DefaultConfig string                `json:"default_config"` // 默认 configId
+	PoolServer    pool.PoolServerConfig `json:"pool_server"`    // 号池服务器配置
+	Debug         bool                  `json:"debug"`          // 调试模式
+	Flow          FlowConfigSection     `json:"flow"`           // Flow 配置
+}
+
+// PoolMode 号池模式
+type PoolMode int
+
+const (
+	PoolModeLocal  PoolMode = iota // 本地模式
+	PoolModeServer                 // 服务器模式（提供号池服务）
+	PoolModeClient                 // 客户端模式（使用远程号池）
+)
+
+var (
+	poolMode         PoolMode
+	remotePoolClient *pool.RemotePoolClient
+	flowClient       *flow.FlowClient
+	flowHandler      *flow.GenerationHandler
+)
 
 var appConfig = AppConfig{
 	ListenAddr: ":8000",
@@ -70,8 +105,6 @@ var appConfig = AppConfig{
 		BrowserRefreshMaxRetry: 1, // 浏览器刷新最多重试1次
 	},
 }
-
-// 兼容旧的环境变量
 var (
 	DataDir       string
 	Proxy         string
@@ -82,6 +115,11 @@ var (
 
 // 保存默认配置到文件
 func saveDefaultConfig(configPath string) error {
+	// 确保目录存在
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(appConfig, "", "  ")
 	if err != nil {
 		return err
@@ -91,7 +129,7 @@ func saveDefaultConfig(configPath string) error {
 
 func loadAppConfig() {
 	// 尝试加载配置文件
-	configPath := "config.json"
+	configPath := "config/config.json"
 	if data, err := os.ReadFile(configPath); err == nil {
 		if err := json.Unmarshal(data, &appConfig); err != nil {
 			log.Printf("⚠️ 解析配置文件失败: %v，使用默认配置", err)
@@ -105,8 +143,6 @@ func loadAppConfig() {
 			log.Printf("❌ 创建默认配置失败: %v", err)
 		}
 	}
-
-	// 环境变量覆盖配置文件
 	if v := os.Getenv("DATA_DIR"); v != "" {
 		appConfig.DataDir = v
 	}
@@ -129,42 +165,118 @@ func loadAppConfig() {
 	ListenAddr = appConfig.ListenAddr
 	DefaultConfig = appConfig.DefaultConfig
 
+	// 应用调试模式
+	logger.SetDebugMode(appConfig.Debug)
+
 	// 应用号池配置
-	SetCooldowns(appConfig.Pool.RefreshCooldownSec, appConfig.Pool.UseCooldownSec)
+	pool.SetCooldowns(appConfig.Pool.RefreshCooldownSec, appConfig.Pool.UseCooldownSec)
 	if appConfig.Pool.MaxFailCount > 0 {
-		MaxFailCount = appConfig.Pool.MaxFailCount
+		pool.MaxFailCount = appConfig.Pool.MaxFailCount
 	}
-	EnableBrowserRefresh = appConfig.Pool.EnableBrowserRefresh
-	BrowserRefreshHeadless = appConfig.Pool.BrowserRefreshHeadless
+	pool.EnableBrowserRefresh = appConfig.Pool.EnableBrowserRefresh
+	pool.BrowserRefreshHeadless = appConfig.Pool.BrowserRefreshHeadless
 	if appConfig.Pool.BrowserRefreshMaxRetry >= 0 {
-		BrowserRefreshMaxRetry = appConfig.Pool.BrowserRefreshMaxRetry
+		pool.BrowserRefreshMaxRetry = appConfig.Pool.BrowserRefreshMaxRetry
+	}
+	pool.DataDir = DataDir
+	pool.DefaultConfig = DefaultConfig
+	pool.Proxy = Proxy
+	register.DataDir = DataDir
+	register.TargetCount = appConfig.Pool.TargetCount
+	register.MinCount = appConfig.Pool.MinCount
+	register.CheckInterval = time.Duration(appConfig.Pool.CheckIntervalMinutes) * time.Minute
+	register.Threads = appConfig.Pool.RegisterThreads
+	register.Headless = appConfig.Pool.RegisterHeadless
+	register.Proxy = Proxy
+
+	if pool.EnableBrowserRefresh && pool.BrowserRefreshMaxRetry > 0 {
+		logger.Info("🌐 浏览器刷新已启用 (headless=%v, 最大重试=%d)", pool.BrowserRefreshHeadless, pool.BrowserRefreshMaxRetry)
+	} else if pool.EnableBrowserRefresh {
+		logger.Info("🌐 浏览器刷新已禁用 (max_retry=0)")
+		pool.EnableBrowserRefresh = false
 	}
 
-	if EnableBrowserRefresh && BrowserRefreshMaxRetry > 0 {
-		log.Printf("🌐 浏览器刷新已启用 (headless=%v, 最大重试=%d)", BrowserRefreshHeadless, BrowserRefreshMaxRetry)
-	} else if EnableBrowserRefresh {
-		log.Printf("🌐 浏览器刷新已禁用 (max_retry=0)")
-		EnableBrowserRefresh = false
+	// 初始化 Flow 客户端
+	initFlowClient()
+}
+
+// initFlowClient 初始化 Flow 客户端
+func initFlowClient() {
+	if !appConfig.Flow.Enable || len(appConfig.Flow.Tokens) == 0 {
+		logger.Info("📹 Flow 服务已禁用")
+		return
 	}
+
+	cfg := flow.FlowConfig{
+		Proxy:           appConfig.Flow.Proxy,
+		Timeout:         appConfig.Flow.Timeout,
+		PollInterval:    appConfig.Flow.PollInterval,
+		MaxPollAttempts: appConfig.Flow.MaxPollAttempts,
+	}
+	if cfg.Proxy == "" {
+		cfg.Proxy = Proxy
+	}
+
+	flowClient = flow.NewFlowClient(cfg)
+
+	// 添加 Tokens
+	for i, st := range appConfig.Flow.Tokens {
+		token := &flow.FlowToken{
+			ID: fmt.Sprintf("flow_token_%d", i),
+			ST: st,
+		}
+		flowClient.AddToken(token)
+	}
+
+	flowHandler = flow.NewGenerationHandler(flowClient)
+	logger.Info("📹 Flow 服务已启用，共 %d 个 Token", len(appConfig.Flow.Tokens))
 }
 
 var FixedModels = []string{
+	// Gemini 文本模型
 	"gemini-2.5-flash",
 	"gemini-2.5-pro",
 	"gemini-3-pro-preview",
 	"gemini-3-pro",
+	// Gemini 图片生成
 	"gemini-2.5-flash-image",
 	"gemini-2.5-pro-image",
 	"gemini-3-pro-preview-image",
 	"gemini-3-pro-image",
+	// Gemini 视频生成
 	"gemini-2.5-flash-video",
 	"gemini-2.5-pro-video",
 	"gemini-3-pro-preview-video",
 	"gemini-3-pro-video",
+	// Gemini 搜索
 	"gemini-2.5-flash-search",
 	"gemini-2.5-pro-search",
 	"gemini-3-pro-preview-search",
 	"gemini-3-pro-search",
+	// Flow 图片生成模型
+	"gemini-2.5-flash-image-landscape",
+	"gemini-2.5-flash-image-portrait",
+	"gemini-3.0-pro-image-landscape",
+	"gemini-3.0-pro-image-portrait",
+	"imagen-4.0-generate-preview-landscape",
+	"imagen-4.0-generate-preview-portrait",
+	// Flow 文生视频 (T2V)
+	"veo_3_1_t2v_fast_portrait",
+	"veo_3_1_t2v_fast_landscape",
+	"veo_2_1_fast_d_15_t2v_portrait",
+	"veo_2_1_fast_d_15_t2v_landscape",
+	"veo_2_0_t2v_portrait",
+	"veo_2_0_t2v_landscape",
+	// Flow 图生视频 (I2V)
+	"veo_3_1_i2v_s_fast_fl_portrait",
+	"veo_3_1_i2v_s_fast_fl_landscape",
+	"veo_2_1_fast_d_15_i2v_portrait",
+	"veo_2_1_fast_d_15_i2v_landscape",
+	"veo_2_0_i2v_portrait",
+	"veo_2_0_i2v_landscape",
+	// Flow 多图生成视频 (R2V)
+	"veo_3_0_r2v_fast_portrait",
+	"veo_3_0_r2v_fast_landscape",
 }
 
 // 模型名称映射到 Google API 的 modelId
@@ -181,11 +293,6 @@ func getEnv(key, def string) string {
 	}
 	return def
 }
-
-// 数据结构和号池管理已移至 pool.go
-// HTTP客户端和工具函数已移至 utils.go
-
-// ==================== Session 管理 ====================
 
 func getCommonHeaders(jwt, origAuth string) map[string]string {
 	headers := map[string]string{
@@ -254,8 +361,6 @@ func createSession(jwt, configID, origAuth string) (string, error) {
 
 	return result.Session.Name, nil
 }
-
-// 上传图片到 Session，返回 fileId（支持 base64 或 URL）
 func uploadContextFile(jwt, configID, sessionName, mimeType, base64Content, origAuth string) (string, error) {
 	ext := "jpg"
 	if parts := strings.Split(mimeType, "/"); len(parts) == 2 {
@@ -311,8 +416,6 @@ func uploadContextFile(jwt, configID, sessionName, mimeType, base64Content, orig
 
 	return result.AddContextFileResponse.FileID, nil
 }
-
-// 通过 URL 上传图片到 Session，返回 fileId
 func uploadContextFileByURL(jwt, configID, sessionName, imageURL, origAuth string) (string, error) {
 	body := map[string]interface{}{
 		"configId":         configID,
@@ -418,17 +521,22 @@ type ChatChoice struct {
 	Delta        map[string]interface{} `json:"delta,omitempty"`
 	Message      map[string]interface{} `json:"message,omitempty"`
 	FinishReason *string                `json:"finish_reason"`
+	Logprobs     interface{}            `json:"logprobs"` // OpenAI兼容
 }
 
 type ChatChunk struct {
-	ID      string       `json:"id"`
-	Object  string       `json:"object"`
-	Created int64        `json:"created"`
-	Model   string       `json:"model"`
-	Choices []ChatChoice `json:"choices"`
+	ID                string       `json:"id"`
+	Object            string       `json:"object"`
+	Created           int64        `json:"created"`
+	Model             string       `json:"model"`
+	SystemFingerprint string       `json:"system_fingerprint,omitempty"`
+	Choices           []ChatChoice `json:"choices"`
 }
 
 func createChunk(id string, created int64, model string, delta map[string]interface{}, finishReason *string) string {
+	if delta == nil {
+		delta = map[string]interface{}{}
+	}
 	chunk := ChatChunk{
 		ID:      id,
 		Object:  "chat.completion.chunk",
@@ -438,6 +546,7 @@ func createChunk(id string, created int64, model string, delta map[string]interf
 			Index:        0,
 			Delta:        delta,
 			FinishReason: finishReason,
+			Logprobs:     nil,
 		}},
 	}
 	data, _ := json.Marshal(chunk)
@@ -453,21 +562,15 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 	if !ok {
 		return
 	}
-
-	// 检查是否是思考内容
 	if thought, ok := content["thought"].(bool); ok && thought {
 		if t, ok := content["text"].(string); ok && t != "" {
 			reasoning = t
 		}
 		return
 	}
-
-	// 提取文本
 	if t, ok := content["text"].(string); ok && t != "" {
 		text = t
 	}
-
-	// 提取图片 (inlineData - 直接返回 base64)
 	if inlineData, ok := content["inlineData"].(map[string]interface{}); ok {
 		if mime, ok := inlineData["mimeType"].(string); ok {
 			imageMime = mime
@@ -476,20 +579,16 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 			imageData = data
 		}
 	}
-
-	// 提取文件 (file - 需要下载，可能是图片或视频)
 	if file, ok := content["file"].(map[string]interface{}); ok {
 		fileId, _ := file["fileId"].(string)
 		mimeType, _ := file["mimeType"].(string)
 		if fileId != "" {
-			// 根据 mimeType 判断类型
 			fileType := "文件"
 			if strings.HasPrefix(mimeType, "image/") {
 				fileType = "图片"
 			} else if strings.HasPrefix(mimeType, "video/") {
 				fileType = "视频"
 			}
-			//	log.Printf("📥 发现%s: fileId=%s, mimeType=%s", fileType, fileId, mimeType)
 			data, err := downloadGeneratedFile(jwt, fileId, session, configID, origAuth)
 			if err != nil {
 				log.Printf("❌ 下载%s失败: %v", fileType, err)
@@ -502,13 +601,9 @@ func extractContentFromReply(replyMap map[string]interface{}, jwt, session, conf
 
 	return
 }
-
-// 下载生成的文件（图片或视频）——带重试机制
 func downloadGeneratedFile(jwt, fileId, session, configID, origAuth string) (string, error) {
 	return downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth, 3)
 }
-
-// downloadGeneratedFileWithRetry 下载文件，带重试机制，遇到 401 时尝试切换账号
 func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth string, maxRetries int) (string, error) {
 	// 参数验证
 	if jwt == "" {
@@ -520,9 +615,6 @@ func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth str
 	if configID == "" {
 		return "", fmt.Errorf("configID 为空，无法下载文件")
 	}
-
-	log.Printf("📥 开始下载文件: fileId=%s, session=%s", fileId, session)
-
 	var lastErr error
 	currentJWT := jwt
 	currentOrigAuth := origAuth
@@ -536,20 +628,16 @@ func downloadGeneratedFileWithRetry(jwt, fileId, session, configID, origAuth str
 		lastErr = err
 		errMsg := err.Error()
 
-		// 检查是否是 401/403 错误
 		if strings.Contains(errMsg, "401") || strings.Contains(errMsg, "403") ||
 			strings.Contains(errMsg, "UNAUTHENTICATED") || strings.Contains(errMsg, "SESSION_COOKIE_INVALID") {
 			log.Printf("⚠️ 下载文件认证失败 (尝试 %d/%d): %v，尝试切换账号...", retry+1, maxRetries, err)
-
-			// 尝试获取新账号
-			newAcc := pool.Next()
+			newAcc := pool.Pool.Next()
 			if newAcc != nil {
 				newJWT, newConfigID, jwtErr := newAcc.GetJWT()
 				if jwtErr == nil {
 					log.Printf("✅ 切换到新账号: %s", newAcc.Data.Email)
 					currentJWT = newJWT
 					currentOrigAuth = newAcc.Data.Authorization
-					// 如果新账号有不同的 configID，也可以更新（但通常 session 是绑定的）
 					_ = newConfigID
 					continue
 				}
@@ -979,6 +1067,185 @@ func convertMessagesToPrompt(messages []Message) string {
 	return result.String()
 }
 
+// ==================== Gemini API 兼容 ====================
+
+// GeminiRequest Gemini generateContent API 请求格式
+type GeminiRequest struct {
+	Contents          []GeminiContent          `json:"contents"`
+	SystemInstruction *GeminiContent           `json:"systemInstruction,omitempty"`
+	GenerationConfig  map[string]interface{}   `json:"generationConfig,omitempty"`
+	GeminiTools       []map[string]interface{} `json:"tools,omitempty"`
+}
+
+type GeminiContent struct {
+	Role  string       `json:"role,omitempty"`
+	Parts []GeminiPart `json:"parts"`
+}
+
+type GeminiPart struct {
+	Text       string            `json:"text,omitempty"`
+	InlineData *GeminiInlineData `json:"inlineData,omitempty"`
+}
+
+type GeminiInlineData struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
+}
+
+// handleGeminiGenerate 处理Gemini generateContent API格式的请求
+func handleGeminiGenerate(c *gin.Context) {
+	action := c.Param("action")
+	if action == "" {
+		c.JSON(400, gin.H{"error": gin.H{"code": 400, "message": "Missing model action", "status": "INVALID_ARGUMENT"}})
+		return
+	}
+
+	action = strings.TrimPrefix(action, "/")
+
+	var model string
+	var isStream bool
+	if idx := strings.LastIndex(action, ":"); idx > 0 {
+		model = action[:idx]
+		actionType := action[idx+1:]
+		isStream = actionType == "streamGenerateContent"
+	} else {
+		model = action
+	}
+
+	if model == "" {
+		model = FixedModels[0]
+	}
+
+	var geminiReq GeminiRequest
+	if err := c.ShouldBindJSON(&geminiReq); err != nil {
+		c.JSON(400, gin.H{"error": gin.H{"code": 400, "message": err.Error(), "status": "INVALID_ARGUMENT"}})
+		return
+	}
+
+	var messages []Message
+
+	// 处理systemInstruction
+	if geminiReq.SystemInstruction != nil && len(geminiReq.SystemInstruction.Parts) > 0 {
+		var sysText string
+		for _, part := range geminiReq.SystemInstruction.Parts {
+			if part.Text != "" {
+				sysText += part.Text
+			}
+		}
+		if sysText != "" {
+			messages = append(messages, Message{Role: "system", Content: sysText})
+		}
+	}
+
+	// 处理contents
+	for _, content := range geminiReq.Contents {
+		role := content.Role
+		if role == "model" {
+			role = "assistant"
+		}
+
+		var textParts []string
+		var contentParts []interface{}
+
+		for _, part := range content.Parts {
+			if part.Text != "" {
+				textParts = append(textParts, part.Text)
+			}
+			if part.InlineData != nil {
+				contentParts = append(contentParts, map[string]interface{}{
+					"type": "image_url",
+					"image_url": map[string]string{
+						"url": fmt.Sprintf("data:%s;base64,%s", part.InlineData.MimeType, part.InlineData.Data),
+					},
+				})
+			}
+		}
+
+		if len(contentParts) > 0 {
+			if len(textParts) > 0 {
+				contentParts = append([]interface{}{map[string]interface{}{"type": "text", "text": strings.Join(textParts, "\n")}}, contentParts...)
+			}
+			messages = append(messages, Message{Role: role, Content: contentParts})
+		} else if len(textParts) > 0 {
+			messages = append(messages, Message{Role: role, Content: strings.Join(textParts, "\n")})
+		}
+	}
+
+	stream := isStream || c.Query("alt") == "sse"
+
+	// 转换Gemini工具格式
+	var tools []ToolDef
+	for _, gt := range geminiReq.GeminiTools {
+		if funcDecls, ok := gt["functionDeclarations"].([]interface{}); ok {
+			for _, fd := range funcDecls {
+				if funcMap, ok := fd.(map[string]interface{}); ok {
+					name, _ := funcMap["name"].(string)
+					desc, _ := funcMap["description"].(string)
+					params, _ := funcMap["parameters"].(map[string]interface{})
+					tools = append(tools, ToolDef{
+						Type: "function",
+						Function: FunctionDef{
+							Name:        name,
+							Description: desc,
+							Parameters:  params,
+						},
+					})
+				}
+			}
+		}
+	}
+
+	req := ChatRequest{
+		Model:    model,
+		Messages: messages,
+		Stream:   stream,
+		Tools:    tools,
+	}
+
+	streamChat(c, req)
+}
+
+// ==================== Claude API 兼容 ====================
+
+type ClaudeRequest struct {
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	System      string    `json:"system,omitempty"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
+	Stream      bool      `json:"stream"`
+	Temperature float64   `json:"temperature,omitempty"`
+	Tools       []ToolDef `json:"tools,omitempty"`
+}
+
+// handleClaudeMessages 处理Claude Messages API格式的请求
+func handleClaudeMessages(c *gin.Context) {
+	var claudeReq ClaudeRequest
+	if err := c.ShouldBindJSON(&claudeReq); err != nil {
+		c.JSON(400, gin.H{"type": "error", "error": gin.H{"type": "invalid_request_error", "message": err.Error()}})
+		return
+	}
+
+	req := ChatRequest{
+		Model:       claudeReq.Model,
+		Messages:    claudeReq.Messages,
+		Stream:      claudeReq.Stream,
+		Temperature: claudeReq.Temperature,
+		Tools:       claudeReq.Tools,
+	}
+
+	// 如果Claude格式有单独的system字段，插入到messages开头
+	if claudeReq.System != "" {
+		systemMsg := Message{Role: "system", Content: claudeReq.System}
+		req.Messages = append([]Message{systemMsg}, req.Messages...)
+	}
+
+	if req.Model == "" {
+		req.Model = FixedModels[0]
+	}
+
+	streamChat(c, req)
+}
+
 // buildToolsSpec 将OpenAI格式的工具定义转换为Gemini的toolsSpec
 func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel, isSearchModel bool) map[string]interface{} {
 	toolsSpec := make(map[string]interface{})
@@ -999,25 +1266,9 @@ func buildToolsSpec(tools []ToolDef, isImageModel, isVideoModel, isSearchModel b
 		toolsSpec["videoGenerationSpec"] = map[string]interface{}{}
 	}
 
-	// 如果有自定义工具，添加functionDeclarations
-	if len(tools) > 0 {
-		var functionDeclarations []map[string]interface{}
-		for _, tool := range tools {
-			if tool.Type == "function" {
-				funcDecl := map[string]interface{}{
-					"name":        tool.Function.Name,
-					"description": tool.Function.Description,
-				}
-				if len(tool.Function.Parameters) > 0 {
-					funcDecl["parameters"] = tool.Function.Parameters
-				}
-				functionDeclarations = append(functionDeclarations, funcDecl)
-			}
-		}
-		if len(functionDeclarations) > 0 {
-			toolsSpec["functionDeclarations"] = functionDeclarations
-		}
-	}
+	// 注意: Google stream_assist_request.tools_spec 不支持 functionDeclarations 字段
+	// 自定义工具暂不支持，忽略 tools 参数
+	_ = tools
 
 	return toolsSpec
 }
@@ -1085,12 +1336,136 @@ func needsConversationContext(messages []Message) bool {
 	}
 	return false
 }
+
+// handleFlowRequest 处理 Flow 模型请求
+func handleFlowRequest(c *gin.Context, req ChatRequest, chatID string, createdTime int64) {
+	if flowHandler == nil {
+		c.JSON(503, gin.H{"error": gin.H{
+			"message": "Flow 服务未启用，请在配置文件中启用并添加 Token",
+			"type":    "service_unavailable",
+		}})
+		return
+	}
+
+	// 解析消息内容和图片
+	var prompt string
+	var imageBytes [][]byte
+
+	for _, msg := range req.Messages {
+		if msg.Role == "user" || msg.Role == "human" {
+			text, images := parseMessageContent(msg)
+			if text != "" {
+				prompt = text
+			}
+			// 提取图片数据
+			for _, img := range images {
+				if img.Data != "" {
+					imgData, err := base64.StdEncoding.DecodeString(img.Data)
+					if err == nil {
+						imageBytes = append(imageBytes, imgData)
+					}
+				}
+			}
+		}
+	}
+
+	if prompt == "" {
+		c.JSON(400, gin.H{"error": gin.H{
+			"message": "Prompt cannot be empty",
+			"type":    "invalid_request_error",
+		}})
+		return
+	}
+
+	flowReq := flow.GenerationRequest{
+		Model:  req.Model,
+		Prompt: prompt,
+		Images: imageBytes,
+		Stream: req.Stream,
+	}
+
+	if req.Stream {
+		// 流式响应
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
+		c.Status(200)
+
+		flusher, ok := c.Writer.(http.Flusher)
+		if !ok {
+			c.JSON(500, gin.H{"error": "Streaming not supported"})
+			return
+		}
+
+		result, _ := flowHandler.HandleGeneration(flowReq, func(chunk string) {
+			c.Writer.WriteString(chunk)
+			flusher.Flush()
+		})
+
+		// 发送 [DONE]
+		c.Writer.WriteString("data: [DONE]\n\n")
+		flusher.Flush()
+
+		if result != nil && !result.Success && result.Error != "" {
+			log.Printf("❌ [Flow] 生成失败: %s", result.Error)
+		}
+	} else {
+		// 非流式响应
+		result, err := flowHandler.HandleGeneration(flowReq, nil)
+		if err != nil {
+			c.JSON(500, gin.H{"error": gin.H{
+				"message": err.Error(),
+				"type":    "internal_error",
+			}})
+			return
+		}
+
+		if !result.Success {
+			c.JSON(500, gin.H{"error": gin.H{
+				"message": result.Error,
+				"type":    "generation_failed",
+			}})
+			return
+		}
+
+		// 构建响应
+		content := result.URL
+		if result.Type == "image" {
+			content = fmt.Sprintf("![Generated Image](%s)", result.URL)
+		} else if result.Type == "video" {
+			content = fmt.Sprintf("<video src='%s' controls></video>", result.URL)
+		}
+
+		c.JSON(200, gin.H{
+			"id":      chatID,
+			"object":  "chat.completion",
+			"created": createdTime,
+			"model":   req.Model,
+			"choices": []gin.H{{
+				"index": 0,
+				"message": gin.H{
+					"role":    "assistant",
+					"content": content,
+				},
+				"finish_reason": "stop",
+			}},
+		})
+	}
+}
+
 func streamChat(c *gin.Context, req ChatRequest) {
 	chatID := "chatcmpl-" + uuid.New().String()
 	createdTime := time.Now().Unix()
 	clientIP := c.ClientIP()
 	// 入站日志
 	log.Printf("📥 [%s] 请求: model=%s ", clientIP, req.Model)
+
+	// 检查是否是 Flow 模型
+	if flow.IsFlowModel(req.Model) {
+		handleFlowRequest(c, req, chatID, createdTime)
+		return
+	}
 	// 解析消息：支持多轮对话拼接和系统提示词
 	var textContent string
 	var images []MediaInfo
@@ -1107,12 +1482,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			}
 		}
 	} else {
-		// 简单情况：处理最后一条用户消息
 		lastMsg := req.Messages[len(req.Messages)-1]
 		userText, userImages := parseMessageContent(lastMsg)
 		images = userImages
-
-		// 系统提示词使用强格式拼接，确保生效
 		if systemPrompt != "" {
 			textContent = fmt.Sprintf("<system>\n%s\n</system>\n\nHuman: %s\n\nAssistant:", systemPrompt, userText)
 		} else {
@@ -1121,15 +1493,14 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	}
 	var respBody []byte
 	var lastErr error
-	var usedAcc *Account
+	var lastErrStatusCode int // 保存最后一次错误的 HTTP 状态码
+	var lastErrBody []byte    // 保存最后一次错误的响应体
+	var usedAcc *pool.Account
 	var usedJWT, usedOrigAuth, usedConfigID, usedSession string
-
-	// 检测是否是可能长时间处理的模型（视频/图片生成）
 	isLongRunning := !req.Stream && (strings.Contains(req.Model, "video") ||
 		strings.Contains(req.Model, "imagen") ||
 		strings.Contains(req.Model, "image"))
 
-	// 对于非流式的长时间任务，启动心跳保持连接
 	var heartbeatDone chan struct{}
 	if isLongRunning {
 		heartbeatDone = make(chan struct{})
@@ -1141,12 +1512,9 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		if ok {
 			flusher.Flush() // 先发送头部
 		}
-
-		// 启动心跳 goroutine
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					// 忽略写入已关闭连接的 panic
 				}
 			}()
 			ticker := time.NewTicker(15 * time.Second)
@@ -1156,9 +1524,8 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				case <-heartbeatDone:
 					return
 				case <-ticker.C:
-					// 发送空格作为心跳（不影响 JSON 解析）
 					if _, err := writer.Write([]byte(" ")); err != nil {
-						return // 写入失败说明连接已关闭
+						return
 					}
 					if flusher, ok := writer.(http.Flusher); ok {
 						flusher.Flush()
@@ -1167,13 +1534,10 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			}
 		}()
 	}
-
-	// 确保心跳 goroutine 在函数退出时停止
 	defer func() {
 		if heartbeatDone != nil {
 			select {
 			case <-heartbeatDone:
-				// 已关闭
 			default:
 				close(heartbeatDone)
 			}
@@ -1181,7 +1545,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	}()
 
 	for retry := 0; retry < maxRetries; retry++ {
-		acc := pool.Next()
+		acc := pool.Pool.Next()
 		if acc == nil {
 			c.JSON(500, gin.H{"error": "没有可用账号"})
 			return
@@ -1205,7 +1569,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			log.Printf("❌ [%s] 创建 Session 失败: %v", acc.Data.Email, err)
 			// 401 错误标记账号需要刷新
 			if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "UNAUTHENTICATED") {
-				//		pool.MarkNeedsRefresh(acc)
+				//		pool.Pool.MarkNeedsRefresh(acc)
 			}
 			lastErr = err
 			continue
@@ -1315,25 +1679,27 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			resp.Body.Close()
 			log.Printf("❌ [%s] Google 报错: %d %s (重试 %d/%d)", acc.Data.Email, resp.StatusCode, string(body), retry+1, maxRetries)
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+			lastErrStatusCode = resp.StatusCode
+			lastErrBody = body
 			// 401/403 无权限，标记需要刷新
 			if resp.StatusCode == 401 || resp.StatusCode == 403 {
 				log.Printf("⚠️ [%s] %d 无权限，标记需要刷新", acc.Data.Email, resp.StatusCode)
-				pool.MarkNeedsRefresh(acc)
+				pool.Pool.MarkNeedsRefresh(acc)
 			}
 			// 429 限流，延长使用冷却时间（3倍冷却）
 			if resp.StatusCode == 429 {
-				cooldownTime := UseCooldown * 3
-				acc.mu.Lock()
+				cooldownTime := pool.UseCooldown * 3
+				acc.Mu.Lock()
 				acc.LastUsed = time.Now().Add(cooldownTime)
-				acc.mu.Unlock()
+				acc.Mu.Unlock()
 				log.Printf("⏳ [%s] 429 限流，账号进入延长冷却 %v", acc.Data.Email, cooldownTime)
 				// 429不计入重试次数，等待后继续尝试其他账号
-				pool.MarkUsed(acc, false)
+				pool.Pool.MarkUsed(acc, false)
 				time.Sleep(1 * time.Second) // 短暂等待后切换账号
 				retry--                     // 不计入重试次数
 				continue
 			}
-			pool.MarkUsed(acc, false) // 标记失败
+			pool.Pool.MarkUsed(acc, false) // 标记失败
 			continue
 		}
 
@@ -1344,7 +1710,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		// 快速检查是否是认证错误响应
 		if bytes.Contains(respBody, []byte("uToken")) && !bytes.Contains(respBody, []byte("streamAssistResponse")) {
 			log.Printf("⚠️ [%s] 收到认证响应，标记需要刷新", acc.Data.Email)
-			pool.MarkNeedsRefresh(acc)
+			pool.Pool.MarkNeedsRefresh(acc)
 			lastErr = fmt.Errorf("认证失败，需要刷新账号")
 			continue
 		}
@@ -1364,13 +1730,18 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		usedSession = session // 保存创建的 session 作为回退
 		usedAcc = acc
 		lastErr = nil
-		pool.MarkUsed(acc, true) // 标记成功
+		pool.Pool.MarkUsed(acc, true) // 标记成功
 		break
 	}
 
 	if lastErr != nil {
 		log.Printf("❌ 所有重试均失败: %v", lastErr)
-		c.JSON(500, gin.H{"error": lastErr.Error()})
+		// 如果有 HTTP 错误响应体，原样透传
+		if lastErrStatusCode > 0 && len(lastErrBody) > 0 {
+			c.Data(lastErrStatusCode, "application/json", lastErrBody)
+		} else {
+			c.JSON(500, gin.H{"error": lastErr.Error()})
+		}
 		return
 	}
 
@@ -1701,15 +2072,17 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			finishReason = "tool_calls"
 		}
 
-		// 构建最终响应
+		// 构建最终响应（完全符合OpenAI格式）
 		response := gin.H{
-			"id":      chatID,
-			"object":  "chat.completion",
-			"created": createdTime,
-			"model":   req.Model,
+			"id":                 chatID,
+			"object":             "chat.completion",
+			"created":            createdTime,
+			"model":              req.Model,
+			"system_fingerprint": "fp_gemini_" + req.Model,
 			"choices": []gin.H{{
 				"index":         0,
 				"message":       message,
+				"logprobs":      nil,
 				"finish_reason": finishReason,
 			}},
 			"usage": gin.H{
@@ -1775,45 +2148,45 @@ func runBrowserRefreshMode(email string) {
 	initHTTPClient()
 
 	// 强制有头模式
-	BrowserRefreshHeadless = false
+	pool.BrowserRefreshHeadless = false
 	log.Println("🌐 有头浏览器刷新模式")
 
-	if err := pool.Load(DataDir); err != nil {
+	if err := pool.Pool.Load(DataDir); err != nil {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
 
-	if pool.TotalCount() == 0 {
+	if pool.Pool.TotalCount() == 0 {
 		log.Fatal("❌ 没有可用账号")
 	}
 
 	// 查找目标账号
-	var targetAcc *Account
-	pool.mu.RLock()
-	if email != "" {
-		// 指定邮箱
-		for _, acc := range pool.readyAccounts {
-			if acc.Data.Email == email {
-				targetAcc = acc
-				break
-			}
-		}
-		if targetAcc == nil {
-			for _, acc := range pool.pendingAccounts {
+	var targetAcc *pool.Account
+	pool.Pool.WithLock(func(ready, pending []*pool.Account) {
+		if email != "" {
+			// 指定邮箱
+			for _, acc := range ready {
 				if acc.Data.Email == email {
 					targetAcc = acc
 					break
 				}
 			}
+			if targetAcc == nil {
+				for _, acc := range pending {
+					if acc.Data.Email == email {
+						targetAcc = acc
+						break
+					}
+				}
+			}
+		} else {
+			// 使用第一个账号
+			if len(ready) > 0 {
+				targetAcc = ready[0]
+			} else if len(pending) > 0 {
+				targetAcc = pending[0]
+			}
 		}
-	} else {
-		// 使用第一个账号
-		if len(pool.readyAccounts) > 0 {
-			targetAcc = pool.readyAccounts[0]
-		} else if len(pool.pendingAccounts) > 0 {
-			targetAcc = pool.pendingAccounts[0]
-		}
-	}
-	pool.mu.RUnlock()
+	})
 
 	if targetAcc == nil {
 		if email != "" {
@@ -1821,7 +2194,7 @@ func runBrowserRefreshMode(email string) {
 		}
 		log.Fatal("❌ 没有可用账号")
 	}
-	result := RefreshCookieWithBrowser(targetAcc, false, Proxy)
+	result := register.RefreshCookieWithBrowser(targetAcc, false, Proxy)
 
 	if result.Success {
 
@@ -1831,7 +2204,7 @@ func runBrowserRefreshMode(email string) {
 		}
 
 		// 更新账号数据
-		targetAcc.mu.Lock()
+		targetAcc.Mu.Lock()
 		targetAcc.Data.Cookies = result.SecureCookies
 		if result.Authorization != "" {
 			targetAcc.Data.Authorization = result.Authorization
@@ -1848,7 +2221,7 @@ func runBrowserRefreshMode(email string) {
 		if len(result.ResponseHeaders) > 0 {
 			targetAcc.Data.ResponseHeaders = result.ResponseHeaders
 		}
-		targetAcc.mu.Unlock()
+		targetAcc.Mu.Unlock()
 
 		// 保存到文件
 		if err := targetAcc.SaveToFile(); err != nil {
@@ -1871,10 +2244,10 @@ func main() {
 	for i, arg := range os.Args[1:] {
 		switch arg {
 		case "--debug", "-d":
-			RegisterDebug = true
+			register.RegisterDebug = true
 			log.Println("🔧 调试模式已启用，将保存截图到 data/screenshots/")
 		case "--once":
-			RegisterOnce = true
+			register.RegisterOnce = true
 			log.Println("🔧 单次运行模式")
 		case "--refresh":
 			refreshMode = true
@@ -1883,11 +2256,10 @@ func main() {
 				refreshEmail = os.Args[i+2]
 			}
 		case "--help", "-h":
-			fmt.Println(`用法: ./gemini-gateway [选项]
+			fmt.Println(`用法: ./business2api [选项]
 
 选项:
   --debug, -d           调试模式，保存注册过程截图
-  --once                单次注册模式（调试用）
   --refresh [email]     有头浏览器刷新账号（不指定email则使用第一个账号）
   --help, -h            显示帮助`)
 			os.Exit(0)
@@ -1902,7 +2274,431 @@ func main() {
 
 	loadAppConfig()
 	initHTTPClient()
-	if err := pool.Load(DataDir); err != nil {
+	if appConfig.PoolServer.Enable {
+		switch appConfig.PoolServer.Mode {
+		case "client":
+			runAsClient()
+			return
+		case "server":
+			runAsServer()
+			return
+		}
+	}
+
+	// 本地模式
+	runLocalMode()
+}
+func runAsClient() {
+	log.Println("🔌 启动客户端模式...")
+	pool.RunBrowserRegister = func(headless bool, proxy string, id int) *pool.BrowserRegisterResult {
+		result := register.RunBrowserRegister(headless, proxy, id)
+		return &pool.BrowserRegisterResult{
+			Success:       result.Success,
+			Email:         result.Email,
+			FullName:      result.FullName,
+			SecureCookies: result.Cookies,
+			Authorization: result.Authorization,
+			ConfigID:      result.ConfigID,
+			CSESIDX:       result.CSESIDX,
+			Error:         result.Error,
+		}
+	}
+	pool.RefreshCookieWithBrowser = func(acc *pool.Account, headless bool, proxy string) *pool.BrowserRefreshResult {
+		result := register.RefreshCookieWithBrowser(acc, headless, proxy)
+		return &pool.BrowserRefreshResult{
+			Success:         result.Success,
+			SecureCookies:   result.SecureCookies,
+			ConfigID:        result.ConfigID,
+			CSESIDX:         result.CSESIDX,
+			Authorization:   result.Authorization,
+			ResponseHeaders: result.ResponseHeaders,
+			Error:           result.Error,
+		}
+	}
+	pool.ClientHeadless = appConfig.Pool.RegisterHeadless
+	pool.ClientProxy = Proxy
+
+	client := pool.NewPoolClient(appConfig.PoolServer)
+	if err := client.Start(); err != nil {
+		log.Fatalf("❌ 客户端启动失败: %v", err)
+	}
+}
+
+var poolServer *pool.PoolServer // 全局号池服务器实例
+
+func runAsServer() {
+	log.Println("🖥️ 启动服务器模式...")
+
+	// 加载账号
+	dataDir := appConfig.PoolServer.DataDir
+	if dataDir == "" {
+		dataDir = DataDir
+	}
+	if err := pool.Pool.Load(dataDir); err != nil {
+		log.Fatalf("❌ 加载账号失败: %v", err)
+	}
+
+	log.Printf("   监听地址: %s", ListenAddr)
+	log.Printf("   WS 端点: %s/ws", ListenAddr)
+	log.Printf("   账号数量: %d", pool.Pool.TotalCount())
+
+	// 创建号池服务器（WS 将集成到 API 服务中）
+	poolServer = pool.NewPoolServer(pool.Pool, appConfig.PoolServer)
+	poolServer.StartBackground() // 启动后台任务分发和心跳检测
+
+	// 启动号池管理
+	pool.Pool.StartPoolManager()
+
+	// 启动 API 服务（包含 WS 端点）
+	runAPIServer()
+}
+
+// runAPIServer 启动 API 服务
+func runAPIServer() {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	setupAPIRoutes(r)
+	log.Printf("🚀 API 服务启动于 %s，账号: ready=%d, pending=%d", ListenAddr, pool.Pool.ReadyCount(), pool.Pool.PendingCount())
+	if err := r.Run(ListenAddr); err != nil {
+		log.Fatalf("❌ API 服务启动失败: %v", err)
+	}
+}
+
+// setupAPIRoutes 设置 API 路由（服务端和本地模式共用）
+func setupAPIRoutes(r *gin.Engine) {
+	// 请求日志中间件
+	r.Use(func(c *gin.Context) {
+		start := time.Now()
+		path := c.Request.URL.Path
+		method := c.Request.Method
+		clientIP := c.ClientIP()
+
+		c.Next()
+
+		latency := time.Since(start)
+		statusCode := c.Writer.Status()
+
+		if statusCode >= 400 {
+			log.Printf("❌ %s %s %s %d %v", clientIP, method, path, statusCode, latency)
+		} else {
+			log.Printf("✅ %s %s %s %d %v", clientIP, method, path, statusCode, latency)
+		}
+	})
+
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status":  "running",
+			"service": "business2api",
+			"version": "2.1.6",
+			"endpoints": gin.H{
+				"openai": "/v1/chat/completions",
+				"claude": "/v1/messages",
+				"gemini": "/v1beta/models/{model}:generateContent",
+				"models": "/v1/models",
+				"health": "/health",
+			},
+			"pool": gin.H{
+				"ready":   pool.Pool.ReadyCount(),
+				"pending": pool.Pool.PendingCount(),
+				"total":   pool.Pool.TotalCount(),
+			},
+		})
+	})
+
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"status":  "ok",
+			"time":    time.Now().UTC().Format(time.RFC3339),
+			"ready":   pool.Pool.ReadyCount(),
+			"pending": pool.Pool.PendingCount(),
+			"mode":    map[PoolMode]string{PoolModeLocal: "local", PoolModeServer: "server", PoolModeClient: "client"}[poolMode],
+		})
+	})
+
+	// WebSocket 端点（服务端模式下用于客户端连接）
+	r.GET("/ws", func(c *gin.Context) {
+		if poolServer == nil {
+			c.JSON(503, gin.H{"error": "WebSocket 服务未启用，仅在服务端模式下可用"})
+			return
+		}
+		poolServer.HandleWS(c.Writer, c.Request)
+	})
+
+	// Pool 内部端点（客户端上传账号等，使用 X-Pool-Secret 鉴权）
+	poolGroup := r.Group("/pool")
+	poolGroup.Use(func(c *gin.Context) {
+		if poolServer == nil {
+			c.JSON(503, gin.H{"error": "Pool 服务未启用"})
+			c.Abort()
+			return
+		}
+		secret := appConfig.PoolServer.Secret
+		if secret != "" && c.GetHeader("X-Pool-Secret") != secret {
+			c.JSON(401, gin.H{"error": "Unauthorized"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
+	poolGroup.POST("/upload-account", func(c *gin.Context) {
+		poolServer.HandleUploadAccount(c.Writer, c.Request)
+	})
+
+	apiGroup := r.Group("/")
+	apiGroup.Use(apiKeyAuth())
+
+	// Gemini 风格模型列表 /v1beta/models
+	apiGroup.GET("/v1beta/models", func(c *gin.Context) {
+		var models []gin.H
+		for _, m := range FixedModels {
+			models = append(models, gin.H{
+				"name":                       "models/" + m,
+				"version":                    "001",
+				"displayName":                m,
+				"description":                "Gemini model: " + m,
+				"inputTokenLimit":            1048576,
+				"outputTokenLimit":           8192,
+				"supportedGenerationMethods": []string{"generateContent", "countTokens"},
+				"temperature":                1.0,
+				"topP":                       0.95,
+				"topK":                       64,
+			})
+		}
+		c.JSON(200, gin.H{"models": models})
+	})
+
+	// OpenAI 风格模型列表
+	apiGroup.GET("/v1/models", func(c *gin.Context) {
+		now := time.Now().Unix()
+		var models []gin.H
+		for _, m := range FixedModels {
+			models = append(models, gin.H{
+				"id":         m,
+				"object":     "model",
+				"created":    now,
+				"owned_by":   "google",
+				"permission": []interface{}{},
+			})
+		}
+		c.JSON(200, gin.H{"object": "list", "data": models})
+	})
+
+	apiGroup.POST("/v1/chat/completions", func(c *gin.Context) {
+		var req ChatRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		if req.Model == "" {
+			req.Model = FixedModels[0]
+		}
+		streamChat(c, req)
+	})
+
+	apiGroup.POST("/v1/messages", handleClaudeMessages)
+
+	// Gemini 单模型详情 GET /v1beta/models/{model}
+	apiGroup.GET("/v1beta/models/:model", func(c *gin.Context) {
+		modelName := c.Param("model")
+		// 移除 "models/" 前缀（如果有）
+		modelName = strings.TrimPrefix(modelName, "models/")
+
+		// 检查模型是否存在
+		found := false
+		for _, m := range FixedModels {
+			if m == modelName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			c.JSON(404, gin.H{"error": gin.H{
+				"code":    404,
+				"message": "Model not found: " + modelName,
+				"status":  "NOT_FOUND",
+			}})
+			return
+		}
+
+		c.JSON(200, gin.H{
+			"name":                       "models/" + modelName,
+			"version":                    "001",
+			"displayName":                modelName,
+			"description":                "Gemini model: " + modelName,
+			"inputTokenLimit":            1048576,
+			"outputTokenLimit":           8192,
+			"supportedGenerationMethods": []string{"generateContent", "countTokens"},
+			"temperature":                1.0,
+			"topP":                       0.95,
+			"topK":                       64,
+		})
+	})
+
+	// Gemini generateContent/streamGenerateContent
+	apiGroup.POST("/v1beta/models/*action", handleGeminiGenerate)
+	apiGroup.POST("/v1/models/*action", handleGeminiGenerate)
+
+	admin := r.Group("/admin")
+	admin.Use(apiKeyAuth())
+	admin.POST("/register", func(c *gin.Context) {
+		var req struct {
+			Count int `json:"count"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || req.Count <= 0 {
+			req.Count = appConfig.Pool.TargetCount - pool.Pool.TotalCount()
+		}
+		if req.Count <= 0 {
+			c.JSON(200, gin.H{"message": "账号数量已足够", "count": pool.Pool.TotalCount()})
+			return
+		}
+		if poolMode == PoolModeServer {
+			// 服务端模式：注册任务会通过 WS 分发给客户端
+			c.JSON(200, gin.H{"message": "注册任务已加入队列，将通过 WS 分发给客户端", "target": req.Count})
+			return
+		}
+		if err := register.StartRegister(req.Count); err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"message": "注册已启动", "target": req.Count})
+	})
+
+	admin.POST("/refresh", func(c *gin.Context) {
+		pool.Pool.Load(DataDir)
+		c.JSON(200, gin.H{
+			"message": "刷新完成",
+			"ready":   pool.Pool.ReadyCount(),
+			"pending": pool.Pool.PendingCount(),
+		})
+	})
+
+	admin.GET("/status", func(c *gin.Context) {
+		stats := pool.Pool.Stats()
+		stats["target"] = appConfig.Pool.TargetCount
+		stats["min"] = appConfig.Pool.MinCount
+		stats["is_registering"] = atomic.LoadInt32(&register.IsRegistering) == 1
+		stats["register_stats"] = register.Stats.Get()
+		stats["mode"] = map[PoolMode]string{PoolModeLocal: "local", PoolModeServer: "server", PoolModeClient: "client"}[poolMode]
+		c.JSON(200, stats)
+	})
+
+	admin.POST("/force-refresh", func(c *gin.Context) {
+		count := pool.Pool.ForceRefreshAll()
+		c.JSON(200, gin.H{
+			"message": "已触发强制刷新",
+			"count":   count,
+		})
+	})
+
+	admin.POST("/config/cooldown", func(c *gin.Context) {
+		var req struct {
+			RefreshCooldownSec int `json:"refresh_cooldown_sec"`
+			UseCooldownSec     int `json:"use_cooldown_sec"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		pool.SetCooldowns(req.RefreshCooldownSec, req.UseCooldownSec)
+		c.JSON(200, gin.H{
+			"message":              "冷却配置已更新",
+			"refresh_cooldown_sec": int(pool.RefreshCooldown.Seconds()),
+			"use_cooldown_sec":     int(pool.UseCooldown.Seconds()),
+		})
+	})
+
+	admin.POST("/browser-refresh", func(c *gin.Context) {
+		var req struct {
+			Email string `json:"email"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		if req.Email == "" {
+			c.JSON(400, gin.H{"error": "需要提供 email"})
+			return
+		}
+
+		var targetAcc *pool.Account
+		pool.Pool.WithLock(func(ready, pending []*pool.Account) {
+			for _, acc := range ready {
+				if acc.Data.Email == req.Email {
+					targetAcc = acc
+					break
+				}
+			}
+			if targetAcc == nil {
+				for _, acc := range pending {
+					if acc.Data.Email == req.Email {
+						targetAcc = acc
+						break
+					}
+				}
+			}
+		})
+
+		if targetAcc == nil {
+			c.JSON(404, gin.H{"error": "账号未找到", "email": req.Email})
+			return
+		}
+
+		go func() {
+			log.Printf("🔄 手动触发浏览器刷新: %s", req.Email)
+			result := register.RefreshCookieWithBrowser(targetAcc, pool.BrowserRefreshHeadless, Proxy)
+			if result.Success {
+				targetAcc.Mu.Lock()
+				targetAcc.Data.Cookies = result.SecureCookies
+				if result.CSESIDX != "" {
+					targetAcc.CSESIDX = result.CSESIDX
+					targetAcc.Data.CSESIDX = result.CSESIDX
+				}
+				targetAcc.FailCount = 0
+				targetAcc.Mu.Unlock()
+
+				if err := targetAcc.SaveToFile(); err != nil {
+					log.Printf("❌ [%s] 保存刷新后的Cookie失败: %v", req.Email, err)
+				}
+				pool.Pool.MarkNeedsRefresh(targetAcc)
+				log.Printf("✅ 手动浏览器刷新成功: %s", req.Email)
+			} else {
+				log.Printf("❌ 手动浏览器刷新失败: %s - %v", req.Email, result.Error)
+			}
+		}()
+
+		c.JSON(200, gin.H{
+			"message": "浏览器刷新已触发",
+			"email":   req.Email,
+		})
+	})
+
+	admin.POST("/config/browser-refresh", func(c *gin.Context) {
+		var req struct {
+			Enable   *bool `json:"enable"`
+			Headless *bool `json:"headless"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(400, gin.H{"error": err.Error()})
+			return
+		}
+		if req.Enable != nil {
+			pool.EnableBrowserRefresh = *req.Enable
+		}
+		if req.Headless != nil {
+			pool.BrowserRefreshHeadless = *req.Headless
+		}
+		c.JSON(200, gin.H{
+			"message":  "浏览器刷新配置已更新",
+			"enable":   pool.EnableBrowserRefresh,
+			"headless": pool.BrowserRefreshHeadless,
+		})
+	})
+}
+
+func runLocalMode() {
+	// 本地模式：正常启动
+	if err := pool.Pool.Load(DataDir); err != nil {
 		log.Fatalf("❌ 加载账号失败: %v", err)
 	}
 
@@ -1918,257 +2714,17 @@ func main() {
 
 	// 启动号池管理
 	if appConfig.Pool.RefreshOnStartup {
-		pool.StartPoolManager()
+		pool.Pool.StartPoolManager()
 	}
-	if pool.TotalCount() == 0 {
+	if pool.Pool.TotalCount() == 0 {
 		needCount := appConfig.Pool.TargetCount
 		log.Printf("📝 无账号，启动注册 %d 个...", needCount)
-		startRegister(needCount)
+		register.StartRegister(needCount)
 	}
 	if appConfig.Pool.CheckIntervalMinutes > 0 {
-		go poolMaintainer()
+		go register.PoolMaintainer()
 	}
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(func(c *gin.Context) {
-		start := time.Now()
-		c.Next()
-		log.Printf("%s %s %d %v", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(start))
-	})
 
-	r.GET("/", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status":  "running",
-			"service": "business2api",
-			"version": "1.0.0",
-			"endpoints": gin.H{
-				"openai": "/v1/chat/completions",
-				"claude": "/v1/messages",
-				"gemini": "/v1beta/models/{model}:generateContent",
-				"models": "/v1/models",
-				"health": "/health",
-			},
-			"pool": gin.H{
-				"ready":   pool.ReadyCount(),
-				"pending": pool.PendingCount(),
-				"total":   pool.TotalCount(),
-			},
-		})
-	})
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status":  "ok",
-			"time":    time.Now().UTC().Format(time.RFC3339),
-			"ready":   pool.ReadyCount(),
-			"pending": pool.PendingCount(),
-		})
-	})
-	api := r.Group("/")
-	api.Use(apiKeyAuth())
-	api.GET("/v1/models", func(c *gin.Context) {
-		now := time.Now().Unix()
-		var models []gin.H
-		for _, m := range FixedModels {
-			models = append(models, gin.H{
-				"id":         m,
-				"object":     "model",
-				"created":    now,
-				"owned_by":   "google",
-				"permission": []interface{}{},
-			})
-		}
-		c.JSON(200, gin.H{"object": "list", "data": models})
-	})
-
-	api.POST("/v1/chat/completions", func(c *gin.Context) {
-		var req ChatRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
-
-		if req.Model == "" {
-			req.Model = FixedModels[0]
-		}
-
-		streamChat(c, req)
-	})
-	api.POST("/v1/messages", handleClaudeMessages)
-	api.POST("/v1beta/models/*action", handleGeminiGenerate)
-	api.POST("/v1/models/*action", handleGeminiGenerate)
-	admin := r.Group("/admin")
-	admin.Use(apiKeyAuth())
-	admin.POST("/register", func(c *gin.Context) {
-		var req struct {
-			Count int `json:"count"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil || req.Count <= 0 {
-			req.Count = appConfig.Pool.TargetCount - pool.Count()
-		}
-		if req.Count <= 0 {
-			c.JSON(200, gin.H{"message": "账号数量已足够", "count": pool.Count()})
-			return
-		}
-		if err := startRegister(req.Count); err != nil {
-			c.JSON(500, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(200, gin.H{"message": "注册已启动", "target": req.Count})
-	})
-	admin.POST("/refresh", func(c *gin.Context) {
-		pool.Load(DataDir)
-		c.JSON(200, gin.H{
-			"message": "刷新完成",
-			"ready":   pool.ReadyCount(),
-			"pending": pool.PendingCount(),
-		})
-	})
-
-	// 获取状态（增强版）
-	admin.GET("/status", func(c *gin.Context) {
-		stats := pool.Stats()
-		stats["target"] = appConfig.Pool.TargetCount
-		stats["min"] = appConfig.Pool.MinCount
-		stats["is_registering"] = atomic.LoadInt32(&isRegistering) == 1
-		stats["register_stats"] = registerStats.Get()
-		c.JSON(200, stats)
-	})
-
-	// 列出所有账号
-	admin.GET("/accounts", func(c *gin.Context) {
-		accounts := pool.ListAccounts()
-		c.JSON(200, gin.H{
-			"count":    len(accounts),
-			"accounts": accounts,
-		})
-	})
-
-	// 强制刷新所有账号
-	admin.POST("/force-refresh", func(c *gin.Context) {
-		count := pool.ForceRefreshAll()
-		c.JSON(200, gin.H{
-			"message": "已触发强制刷新",
-			"count":   count,
-		})
-	})
-
-	// 更新冷却配置
-	admin.POST("/config/cooldown", func(c *gin.Context) {
-		var req struct {
-			RefreshCooldownSec int `json:"refresh_cooldown_sec"`
-			UseCooldownSec     int `json:"use_cooldown_sec"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
-		SetCooldowns(req.RefreshCooldownSec, req.UseCooldownSec)
-		c.JSON(200, gin.H{
-			"message":              "冷却配置已更新",
-			"refresh_cooldown_sec": int(RefreshCooldown.Seconds()),
-			"use_cooldown_sec":     int(UseCooldown.Seconds()),
-		})
-	})
-
-	// 手动触发浏览器刷新指定账号
-	admin.POST("/browser-refresh", func(c *gin.Context) {
-		var req struct {
-			Email string `json:"email"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
-
-		if req.Email == "" {
-			c.JSON(400, gin.H{"error": "需要提供 email"})
-			return
-		}
-
-		// 查找账号
-		accounts := pool.ListAccounts()
-		var targetAcc *Account
-		pool.mu.RLock()
-		for _, acc := range pool.readyAccounts {
-			if acc.Data.Email == req.Email {
-				targetAcc = acc
-				break
-			}
-		}
-		if targetAcc == nil {
-			for _, acc := range pool.pendingAccounts {
-				if acc.Data.Email == req.Email {
-					targetAcc = acc
-					break
-				}
-			}
-		}
-		pool.mu.RUnlock()
-
-		if targetAcc == nil {
-			c.JSON(404, gin.H{"error": "账号未找到", "email": req.Email})
-			return
-		}
-
-		// 执行浏览器刷新
-		go func() {
-			log.Printf(" 手动触发浏览器刷新: %s", req.Email)
-			result := RefreshCookieWithBrowser(targetAcc, BrowserRefreshHeadless, Proxy)
-			if result.Success {
-				targetAcc.mu.Lock()
-				targetAcc.Data.Cookies = result.SecureCookies
-				if result.CSESIDX != "" {
-					targetAcc.CSESIDX = result.CSESIDX
-					targetAcc.Data.CSESIDX = result.CSESIDX
-				}
-				targetAcc.FailCount = 0
-				targetAcc.mu.Unlock()
-
-				if err := targetAcc.SaveToFile(); err != nil {
-					log.Printf(" [%s] 保存刷新后的Cookie失败: %v", req.Email, err)
-				}
-				pool.MarkNeedsRefresh(targetAcc)
-				log.Printf(" 手动浏览器刷新成功: %s", req.Email)
-			} else {
-				log.Printf(" 手动浏览器刷新失败: %s - %v", req.Email, result.Error)
-			}
-		}()
-
-		c.JSON(200, gin.H{
-			"message": "浏览器刷新已触发",
-			"email":   req.Email,
-		})
-		_ = accounts // 避免未使用警告
-	})
-
-	// 切换浏览器刷新开关
-	admin.POST("/config/browser-refresh", func(c *gin.Context) {
-		var req struct {
-			Enable   *bool `json:"enable"`
-			Headless *bool `json:"headless"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			c.JSON(400, gin.H{"error": err.Error()})
-			return
-		}
-
-		if req.Enable != nil {
-			EnableBrowserRefresh = *req.Enable
-		}
-		if req.Headless != nil {
-			BrowserRefreshHeadless = *req.Headless
-		}
-
-		c.JSON(200, gin.H{
-			"message":  "浏览器刷新配置已更新",
-			"enable":   EnableBrowserRefresh,
-			"headless": BrowserRefreshHeadless,
-		})
-	})
-
-	log.Printf(" 服务启动于 %s，账号: ready=%d, pending=%d", ListenAddr, pool.ReadyCount(), pool.PendingCount())
-	if err := r.Run(ListenAddr); err != nil {
-		log.Fatalf(" 服务启动失败: %v", err)
-	}
+	// 启动 API 服务
+	runAPIServer()
 }

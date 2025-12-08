@@ -1,0 +1,38 @@
+{
+  "api_keys": ["your-api-key-here"],
+  "listen_addr": ":8000",
+  "data_dir": "./data",
+  "default_config": "",
+  "proxy": "",
+  "debug": false,
+  "pool": {
+    "target_count": 50,
+    "min_count": 10,
+    "check_interval_minutes": 30,
+    "register_threads": 1,
+    "register_headless": true,
+    "refresh_on_startup": true,
+    "refresh_cooldown_sec": 240,
+    "use_cooldown_sec": 15,
+    "max_fail_count": 3,
+    "enable_browser_refresh": true,
+    "browser_refresh_headless": true,
+    "browser_refresh_max_retry": 1
+  },
+  "pool_server": {
+    "enable": false,
+    "mode": "local",
+    "server_addr": "http://server-ip:8000",
+    "secret": "your-secret-key",
+    "target_count": 50,
+    "data_dir": "./data"
+  },
+  "flow": {
+    "enable": false,
+    "tokens": [],
+    "proxy": "",
+    "timeout": 120,
+    "poll_interval": 3,
+    "max_poll_attempts": 500
+  }
+}
