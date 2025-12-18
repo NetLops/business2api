@@ -679,6 +679,11 @@ curl http://localhost:8000/admin/ip \
 
 ---
 
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=XxxXTeam/business2api&type=date&legend=top-left)](https://www.star-history.com/#XxxXTeam/business2api&type=date&legend=top-left)
+
 ## 📄 License
 
 MIT License
